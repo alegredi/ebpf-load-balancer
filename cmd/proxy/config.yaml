@@ -1,0 +1,6 @@
+healthCheckInterval: 10s
+cacheInvalidationTimer: 30s
+backends:
+  - url: http://localhost:8081
+    healthEndpoint: /   # endpoint per healthcheck
+  - url: http://localhost:8082 # nessun healthEndpoint → solo TCP ping
