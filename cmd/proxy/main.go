@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"log"
 	"net/http"
 	"net/http/httptest"
@@ -134,7 +135,9 @@ func main() {
 	})
 
 	// healthcheck
-	healthcheck.StartHealthCheck(lb, healthcheckInterval)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	healthcheck.StartHealthCheck(ctx, lb, healthcheckInterval)
 
 	// logging periodico dei backend
 	go func() {

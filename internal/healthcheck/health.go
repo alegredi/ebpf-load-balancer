@@ -1,6 +1,7 @@
 package healthcheck
 
 import (
+	"context"
 	"net"
 	"net/http"
 	"net/url"
@@ -8,10 +9,16 @@ import (
 	"time"
 )
 
+var healthClient = &http.Client{
+	Timeout: 2 * time.Second,
+	Transport: &http.Transport{
+		DisableKeepAlives: true,
+	},
+}
+
 func checkBackend(b *balancer.Backend) bool {
 	if b.HealthEndpoint != "" {
-		client := http.Client{Timeout: 2 * time.Second}
-		resp, err := client.Get(b.URL + b.HealthEndpoint)
+		resp, err := healthClient.Get(b.URL + b.HealthEndpoint)
 		if err != nil {
 			return false
 		}
@@ -31,7 +38,8 @@ func checkBackend(b *balancer.Backend) bool {
 	return true
 }
 
-func StartHealthCheck(lb *balancer.LoadBalancer, interval time.Duration) {
+// StartHealthCheck starts health checks for all backends with graceful context cancellation.
+func StartHealthCheck(ctx context.Context, lb *balancer.LoadBalancer, interval time.Duration) {
 	for _, backend := range lb.Backends {
 		go func(b *balancer.Backend) {
 			alive := checkBackend(b)
@@ -39,9 +47,14 @@ func StartHealthCheck(lb *balancer.LoadBalancer, interval time.Duration) {
 			ticker := time.NewTicker(interval)
 			defer ticker.Stop()
 
-			for range ticker.C {
-				alive := checkBackend(b)
-				b.SetAlive(alive)
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+					alive := checkBackend(b)
+					b.SetAlive(alive)
+				}
 			}
 		}(backend)
 	}

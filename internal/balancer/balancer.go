@@ -23,10 +23,12 @@ func (b *Backend) IncConn() {
 func (b *Backend) DecConn() {
 	for {
 		current := atomic.LoadInt32(&b.ActiveConnections)
-		if current == 0 {
+		if current <= 0 {
 			return
 		}
-		atomic.AddInt32(&b.ActiveConnections, -1)
+		if atomic.CompareAndSwapInt32(&b.ActiveConnections, current, current-1) {
+			return
+		}
 	}
 }
 
