@@ -1,26 +1,53 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"errors"
+	"io"
 	"log"
 	"net/http"
-	"net/http/httptest"
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"os/signal"
 	"proxy/internal/balancer"
 	"proxy/internal/config"
 	"proxy/internal/healthcheck"
 	"proxy/pkg/cache"
+	"sync"
+	"syscall"
 	"time"
 )
 
+var bufPool = sync.Pool{
+	New: func() any {
+		return new(bytes.Buffer)
+	},
+}
+
+type responseRecorder struct {
+	http.ResponseWriter
+	statusCode int
+	body       *bytes.Buffer
+}
+
+func (r *responseRecorder) WriteHeader(code int) {
+	r.statusCode = code
+	r.ResponseWriter.WriteHeader(code)
+}
+
+func (r *responseRecorder) Write(b []byte) (int, error) {
+	if r.body != nil {
+		r.body.Write(b)
+	}
+	return r.ResponseWriter.Write(b)
+}
+
 func main() {
 	log.SetOutput(os.Stdout)
+	log.Println("[INFO] Starting Reverse Proxy...")
 
-	cacheLRU := cache.NewLRUCache(2)
-
-	// reads config
 	cfg, err := config.LoadConfig("config.yaml")
 	if err != nil {
 		log.Fatalf("cannot load config: %v", err)
@@ -28,42 +55,42 @@ func main() {
 
 	cacheInvalidationTimer, err := time.ParseDuration(cfg.CacheInvalidationTimer)
 	if err != nil {
-		cacheInvalidationTimer, _ = time.ParseDuration("30s")
+		cacheInvalidationTimer = 30 * time.Second
 	}
 
-	healthcheckInterval, err := time.ParseDuration(cfg.HealthCheckInterval)
-	if err != nil {
-		healthcheckInterval, _ = time.ParseDuration("30s")
-	}
+	healthcheckInterval := cfg.HealthCheckDuration()
+	cacheLRU := cache.NewLRUCache(128)
 
 	var backends []*balancer.Backend
 	for _, bcfg := range cfg.Backends {
-		targetURL, _ := url.Parse(bcfg.URL)
-		proxy := httputil.NewSingleHostReverseProxy(targetURL)
-
-		// proxy optimization
-		proxy.Transport = &http.Transport{
-			MaxIdleConns:        100,
-			MaxIdleConnsPerHost: 10,
-			IdleConnTimeout:     60 * time.Second,
+		targetURL, err := url.Parse(bcfg.URL)
+		if err != nil {
+			log.Fatalf("invalid backend url %s: %v", bcfg.URL, err)
 		}
 
-		originalDirector := proxy.Director
+		proxy := httputil.NewSingleHostReverseProxy(targetURL)
+		proxy.Transport = &http.Transport{
+			MaxIdleConns:          256,
+			MaxIdleConnsPerHost:   64,
+			IdleConnTimeout:       90 * time.Second,
+			ResponseHeaderTimeout: 10 * time.Second,
+		}
+
+		origDirector := proxy.Director
 		proxy.Director = func(req *http.Request) {
-			originalDirector(req)
+			origDirector(req)
 			req.Host = targetURL.Host
 		}
 
 		proxy.ErrorHandler = func(rw http.ResponseWriter, r *http.Request, e error) {
-			log.Printf("backend error %s: %v", bcfg.URL, e)
-			http.Error(rw, "backend error", http.StatusBadGateway)
+			log.Printf("[ERROR] Backend error for %s: %v", bcfg.URL, e)
+			http.Error(rw, "bad gateway", http.StatusBadGateway)
 		}
 
 		backends = append(backends, &balancer.Backend{
-			URL:               bcfg.URL,
-			HealthEndpoint:    bcfg.HealthEndpoint,
-			ActiveConnections: 0,
-			Proxy:             proxy,
+			URL:            bcfg.URL,
+			HealthEndpoint: bcfg.HealthEndpoint,
+			Proxy:          proxy,
 		})
 	}
 
@@ -71,95 +98,113 @@ func main() {
 		Backends: backends,
 	}
 
-	// proxy server entrypoint
-	http.HandleFunc("/", func(writer http.ResponseWriter, request *http.Request) {
-		if request.Method == http.MethodGet {
-			cacheKEY := cache.CacheKey(request)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-			// HIT
-			if resp, isCached := cacheLRU.Get(cacheKEY); isCached {
-				log.Printf("Cache HIT for %s", cacheKEY)
-				for k, vv := range resp.Header {
+	healthcheck.StartHealthCheck(ctx, lb, healthcheckInterval)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			key := cache.CacheKey(r)
+			if cached, ok := cacheLRU.Get(key); ok {
+				for k, vv := range cached.Header {
 					for _, v := range vv {
-						writer.Header().Add(k, v)
+						w.Header().Add(k, v)
 					}
 				}
-				writer.WriteHeader(resp.StatusCode)
-				writer.Write(resp.Body)
+				w.Header().Set("X-Cache", "HIT")
+				w.WriteHeader(cached.StatusCode)
+				_, _ = w.Write(cached.Body)
 				return
 			}
 
 			backend, err := lb.GetLeastConnBackend()
 			if err != nil {
-				http.Error(writer, "no available backends", http.StatusServiceUnavailable)
+				http.Error(w, "no available backends", http.StatusServiceUnavailable)
 				return
 			}
-
 			backend.IncConn()
 			defer backend.DecConn()
 
-			rec := httptest.NewRecorder()
-			backend.Proxy.ServeHTTP(rec, request)
+			buf := bufPool.Get().(*bytes.Buffer)
+			buf.Reset()
+			defer bufPool.Put(buf)
 
-			body := rec.Body.Bytes()
-			cached := &cache.CachedResponse{
-				StatusCode: rec.Result().StatusCode,
-				Header:     rec.Result().Header.Clone(),
-				Body:       body,
-				ExpiresAt:  time.Now().Add(cacheInvalidationTimer),
+			rec := &responseRecorder{
+				ResponseWriter: w,
+				statusCode:     http.StatusOK,
+				body:           buf,
 			}
-			err = cacheLRU.Put(cacheKEY, cached)
-			if err != nil {
-				return
-			}
+			w.Header().Set("X-Cache", "MISS")
+			backend.Proxy.ServeHTTP(rec, r)
 
-			for k, vv := range rec.Header() {
-				for _, v := range vv {
-					writer.Header().Set(k, v)
-				}
+			if rec.statusCode >= 200 && rec.statusCode < 300 {
+				_ = cacheLRU.Put(key, &cache.CachedResponse{
+					StatusCode: rec.statusCode,
+					Header:     w.Header().Clone(),
+					Body:       buf.Bytes(),
+					ExpiresAt:  time.Now().Add(cacheInvalidationTimer),
+				})
 			}
-			writer.WriteHeader(rec.Code)
-			writer.Write(body)
 			return
 		}
 
-		// (POST, PUT...) no cache
 		backend, err := lb.GetLeastConnBackend()
 		if err != nil {
-			http.Error(writer, "no available backends", http.StatusServiceUnavailable)
+			http.Error(w, "no available backends", http.StatusServiceUnavailable)
 			return
 		}
 		backend.IncConn()
 		defer backend.DecConn()
-		backend.Proxy.ServeHTTP(writer, request)
+		backend.Proxy.ServeHTTP(w, r)
 	})
 
-	// healthcheck
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	healthcheck.StartHealthCheck(ctx, lb, healthcheckInterval)
-
-	// logging periodico dei backend
+	// Periodic status log
 	go func() {
+		ticker := time.NewTicker(10 * time.Second)
+		defer ticker.Stop()
 		for {
-			time.Sleep(time.Millisecond)
-			printBackends(lb)
-			time.Sleep(10 * time.Second)
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				for _, b := range lb.Backends {
+					log.Printf("[STATUS] Backend: %s | ActiveConns: %d | Alive: %t",
+						b.URL, b.GetActiveConnections(), b.IsAlive())
+				}
+			}
 		}
 	}()
 
-	log.Printf("Starting proxy server on :8080")
-	if err := http.ListenAndServe(":8080", nil); err != nil {
-		log.Fatalf("server failed: %v", err)
+	server := &http.Server{
+		Addr:         ":8080",
+		Handler:      mux,
+		ReadTimeout:  15 * time.Second,
+		WriteTimeout: 15 * time.Second,
+		IdleTimeout:  60 * time.Second,
 	}
+
+	go func() {
+		log.Printf("[INFO] Proxy listening on %s", server.Addr)
+		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Fatalf("server error: %v", err)
+		}
+	}()
+
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+	<-sigChan
+
+	log.Println("[INFO] Shutting down proxy server gracefully...")
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer shutdownCancel()
+
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		log.Printf("[ERROR] Server forced to shutdown: %v", err)
+	}
+	log.Println("[INFO] Server exited successfully.")
 }
 
-func printBackends(lb *balancer.LoadBalancer) {
-	for _, backend := range lb.Backends {
-		log.Printf("Backend → URL: %s, CONNECTIONS: %d, ALIVE: %t",
-			backend.URL,
-			backend.ActiveConnections,
-			backend.IsAlive(),
-		)
-	}
-}
+// Suppress unused import warnings if any
+var _ = io.Discard
