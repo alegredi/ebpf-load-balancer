@@ -21,12 +21,30 @@ type xdpLbBackendInfo struct {
 	Active uint32
 }
 
+type xdpLbFlowKey struct {
+	_        structs.HostLayout
+	SrcIp    uint32
+	DstIp    uint32
+	SrcPort  uint16
+	DstPort  uint16
+	Protocol uint8
+	Pad      [3]uint8
+}
+
+type xdpLbFlowValue struct {
+	_            structs.HostLayout
+	BackendIndex uint32
+	_            [4]byte
+	CreatedAtNs  uint64
+}
+
 type xdpLbServiceConfig struct {
 	_           structs.HostLayout
 	Vip         uint32
 	Port        uint16
 	NumBackends uint16
 	Enabled     uint32
+	ForwardMode uint32
 }
 
 type xdpLbStatsRecord struct {
@@ -42,10 +60,11 @@ type xdpLbStatsRecord struct {
 //
 // Used for safe lookups in a Collection or CollectionSpec.
 const (
-	xdpLbMapBackendsMap = "backends_map"
-	xdpLbMapServiceMap  = "service_map"
-	xdpLbMapStatsMap    = "stats_map"
-	xdpLbProgXdpLbFunc  = "xdp_lb_func"
+	xdpLbMapBackendsMap     = "backends_map"
+	xdpLbMapConnectionTable = "connection_table"
+	xdpLbMapServiceMap      = "service_map"
+	xdpLbMapStatsMap        = "stats_map"
+	xdpLbProgXdpLbFunc      = "xdp_lb_func"
 )
 
 // loadXdpLb returns the embedded CollectionSpec for xdpLb.
@@ -97,9 +116,10 @@ type xdpLbProgramSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type xdpLbMapSpecs struct {
-	BackendsMap *ebpf.MapSpec `ebpf:"backends_map"`
-	ServiceMap  *ebpf.MapSpec `ebpf:"service_map"`
-	StatsMap    *ebpf.MapSpec `ebpf:"stats_map"`
+	BackendsMap     *ebpf.MapSpec `ebpf:"backends_map"`
+	ConnectionTable *ebpf.MapSpec `ebpf:"connection_table"`
+	ServiceMap      *ebpf.MapSpec `ebpf:"service_map"`
+	StatsMap        *ebpf.MapSpec `ebpf:"stats_map"`
 }
 
 // xdpLbVariableSpecs contains global variables before they are loaded into the kernel.
@@ -128,14 +148,16 @@ func (o *xdpLbObjects) Close() error {
 //
 // It can be passed to loadXdpLbObjects or ebpf.CollectionSpec.LoadAndAssign.
 type xdpLbMaps struct {
-	BackendsMap *ebpf.Map `ebpf:"backends_map"`
-	ServiceMap  *ebpf.Map `ebpf:"service_map"`
-	StatsMap    *ebpf.Map `ebpf:"stats_map"`
+	BackendsMap     *ebpf.Map `ebpf:"backends_map"`
+	ConnectionTable *ebpf.Map `ebpf:"connection_table"`
+	ServiceMap      *ebpf.Map `ebpf:"service_map"`
+	StatsMap        *ebpf.Map `ebpf:"stats_map"`
 }
 
 func (m *xdpLbMaps) Close() error {
 	return _XdpLbClose(
 		m.BackendsMap,
+		m.ConnectionTable,
 		m.ServiceMap,
 		m.StatsMap,
 	)
