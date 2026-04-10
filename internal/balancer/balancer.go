@@ -8,12 +8,17 @@ import (
 	"sync/atomic"
 )
 
+// Backend represents a registered upstream server.
 type Backend struct {
-	URL               string
-	HealthEndpoint    string
-	ActiveConnections int32
-	alive             int32 // 0 = false, 1 = true
-	Proxy             *httputil.ReverseProxy
+	Index                uint32
+	URL                  string
+	HealthEndpoint       string
+	Weight               uint32
+	ActiveConnections    int32
+	alive                int32 // 0 = false, 1 = true
+	consecutiveFails     int32
+	consecutiveSuccesses int32
+	Proxy                *httputil.ReverseProxy
 }
 
 func (b *Backend) IncConn() {
@@ -48,14 +53,40 @@ func (b *Backend) IsAlive() bool {
 	return atomic.LoadInt32(&b.alive) == 1
 }
 
+// MarkSuccess records a successful health probe and applies hysteresis.
+// Returns true if the backend transitioned from down to up.
+func (b *Backend) MarkSuccess(threshold int32) bool {
+	atomic.StoreInt32(&b.consecutiveFails, 0)
+	succ := atomic.AddInt32(&b.consecutiveSuccesses, 1)
+	if succ >= threshold && !b.IsAlive() {
+		b.SetAlive(true)
+		return true
+	}
+	return false
+}
+
+// MarkFailure records a failed health probe and applies hysteresis.
+// Returns true if the backend transitioned from up to down.
+func (b *Backend) MarkFailure(threshold int32) bool {
+	atomic.StoreInt32(&b.consecutiveSuccesses, 0)
+	fails := atomic.AddInt32(&b.consecutiveFails, 1)
+	if fails >= threshold && b.IsAlive() {
+		b.SetAlive(false)
+		return true
+	}
+	return false
+}
+
+// LoadBalancer coordinates routing across backends.
 type LoadBalancer struct {
 	Backends []*Backend
 	mu       sync.RWMutex
 }
 
+// GetLeastConnBackend selects the alive backend with the fewest active connections.
 func (l *LoadBalancer) GetLeastConnBackend() (*Backend, error) {
-	l.mu.RLock()         // allow concurrent reads
-	defer l.mu.RUnlock() // unlock after function
+	l.mu.RLock()
+	defer l.mu.RUnlock()
 
 	if len(l.Backends) == 0 {
 		return nil, errors.New("no backends available")

@@ -101,7 +101,7 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	healthcheck.StartHealthCheck(ctx, lb, healthcheckInterval)
+	healthcheck.StartHealthCheck(ctx, lb, healthcheckInterval, nil)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {

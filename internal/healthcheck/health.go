@@ -16,6 +16,9 @@ var healthClient = &http.Client{
 	},
 }
 
+// StatusChangeCallback is invoked when a backend transitions healthy <-> unhealthy.
+type StatusChangeCallback func(b *balancer.Backend, alive bool)
+
 func checkBackend(b *balancer.Backend) bool {
 	if b.HealthEndpoint != "" {
 		resp, err := healthClient.Get(b.URL + b.HealthEndpoint)
@@ -38,12 +41,16 @@ func checkBackend(b *balancer.Backend) bool {
 	return true
 }
 
-// StartHealthCheck starts health checks for all backends with graceful context cancellation.
-func StartHealthCheck(ctx context.Context, lb *balancer.LoadBalancer, interval time.Duration) {
+// StartHealthCheck starts health checks for all backends with hysteresis and status callbacks.
+func StartHealthCheck(ctx context.Context, lb *balancer.LoadBalancer, interval time.Duration, onStatus StatusChangeCallback) {
 	for _, backend := range lb.Backends {
 		go func(b *balancer.Backend) {
 			alive := checkBackend(b)
 			b.SetAlive(alive)
+			if onStatus != nil {
+				onStatus(b, alive)
+			}
+
 			ticker := time.NewTicker(interval)
 			defer ticker.Stop()
 
@@ -52,8 +59,16 @@ func StartHealthCheck(ctx context.Context, lb *balancer.LoadBalancer, interval t
 				case <-ctx.Done():
 					return
 				case <-ticker.C:
-					alive := checkBackend(b)
-					b.SetAlive(alive)
+					ok := checkBackend(b)
+					if ok {
+						if b.MarkSuccess(2) && onStatus != nil {
+							onStatus(b, true)
+						}
+					} else {
+						if b.MarkFailure(2) && onStatus != nil {
+							onStatus(b, false)
+						}
+					}
 				}
 			}
 		}(backend)
