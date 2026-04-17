@@ -1,6 +1,22 @@
-healthCheckInterval: 10s
+# eBPF / XDP Load Balancer Configuration
+interface: "lo"
+mode: "dual" # options: "xdp" (kernel L4 only), "l7" (user-space only), "dual" (xdp + l7 fallback)
+vip: "127.0.0.1"
+port: 8080
+metricsAddr: ":9090"
+healthCheckInterval: 5s
 cacheInvalidationTimer: 30s
+
 backends:
-  - url: http://localhost:8081
-    healthEndpoint: /   # endpoint per healthcheck
-  - url: http://localhost:8082 # nessun healthEndpoint → solo TCP ping
+  - url: http://127.0.0.1:8081
+    healthEndpoint: /
+    ip: "127.0.0.1"
+    port: 8081
+    mac: "00:00:00:00:00:00"
+    weight: 1
+  - url: http://127.0.0.1:8082
+    healthEndpoint: ""
+    ip: "127.0.0.1"
+    port: 8082
+    mac: "00:00:00:00:00:00"
+    weight: 1
