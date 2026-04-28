@@ -10,6 +10,7 @@ import (
 
 var ErrBadStatusCode = errors.New("response not cacheable due to status code")
 
+/* CachedResponse stores the serialized response body, headers, and TTL. */
 type CachedResponse struct {
 	StatusCode int
 	Header     http.Header
@@ -22,6 +23,9 @@ type entry struct {
 	value *CachedResponse
 }
 
+/* LRUCache implements a concurrency-safe Least Recently Used cache with TTL.
+ * It combines a doubly linked list for O(1) eviction ordering with a hash table
+ * for O(1) key lookups. */
 type LRUCache struct {
 	capacity int
 	items    map[string]*list.Element
@@ -45,18 +49,22 @@ func (c *LRUCache) Get(key string) (*CachedResponse, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if el, ok := c.items[key]; ok {
-		resp := el.Value.(*entry).value
-		// delete cached response if expired
-		if time.Now().After(resp.ExpiresAt) {
-			c.order.Remove(el)
-			delete(c.items, key)
-			return nil, false
-		}
-		c.order.MoveToFront(el)
-		return resp, true
+	el, ok := c.items[key]
+	if !ok {
+		return nil, false
 	}
-	return nil, false
+
+	resp := el.Value.(*entry).value
+
+	/* Lazy eviction: check expiration on access. */
+	if time.Now().After(resp.ExpiresAt) {
+		c.order.Remove(el)
+		delete(c.items, key)
+		return nil, false
+	}
+
+	c.order.MoveToFront(el)
+	return resp, true
 }
 
 func (c *LRUCache) Put(key string, value *CachedResponse) error {
@@ -64,11 +72,11 @@ func (c *LRUCache) Put(key string, value *CachedResponse) error {
 		return ErrBadStatusCode
 	}
 
-	// copia sicura del body
-	bodyCopy := append([]byte(nil), value.Body...)
+	/* Clone body bytes to decouple cache storage from network socket buffers. */
+	bodyCopy := make([]byte, len(value.Body))
+	copy(bodyCopy, value.Body)
 	value.Body = bodyCopy
 
-	// check for nil header
 	if value.Header == nil {
 		value.Header = make(http.Header)
 	}
@@ -76,14 +84,14 @@ func (c *LRUCache) Put(key string, value *CachedResponse) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	// update existing
+	/* If key exists, update value and bump to the front of LRU order. */
 	if el, ok := c.items[key]; ok {
 		el.Value.(*entry).value = value
 		c.order.MoveToFront(el)
 		return nil
 	}
 
-	// capacity check
+	/* Evict least-recently used entry if we reached capacity. */
 	if c.order.Len() >= c.capacity {
 		oldest := c.order.Back()
 		if oldest != nil {
@@ -93,16 +101,15 @@ func (c *LRUCache) Put(key string, value *CachedResponse) error {
 		}
 	}
 
-	// add
-	el := c.order.PushFront(&entry{key, value})
+	el := c.order.PushFront(&entry{key: key, value: value})
 	c.items[key] = el
-
 	return nil
 }
 
 func (c *LRUCache) Delete(key string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
 	if el, ok := c.items[key]; ok {
 		c.order.Remove(el)
 		delete(c.items, key)
