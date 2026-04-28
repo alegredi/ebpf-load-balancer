@@ -1,0 +1,6 @@
+# Ignore kernel BTF header from language statistics and PR diffs
+bpf/vmlinux.h linguist-vendored
+bpf/vmlinux.h linguist-generated
+
+# Mark bpf2go generated bindings as generated
+pkg/bpf/xdplb_bpf.go linguist-generated
